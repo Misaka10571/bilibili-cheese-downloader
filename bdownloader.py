@@ -9,6 +9,9 @@ import threading
 import qrcode
 from tkinter import Tk, Canvas, PhotoImage
 import asyncio
+from asyncio import Semaphore
+from concurrent.futures import ThreadPoolExecutor
+import concurrent.futures
 
 # 导入bilibili-api库
 from bilibili_api import Credential, cheese, video, sync
@@ -27,8 +30,16 @@ def parse_time_2_sec(s):
     seconds += int(seconds_milliseconds)
     return seconds
 
+# 格式化标题，使进度条显示整齐
+def format_title(title, max_length=20):
+    if len(title) > max_length:
+        return title[:max_length-3] + "..."
+    else:
+        # 填充空格使所有标题长度一致
+        return title.ljust(max_length)
+
 # 下载文件
-async def download_file(url, save_path, desc):
+async def download_file(url, save_path, desc, task_index, total_tasks, task_type):
     # 发送GET请求获取文件大小
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
@@ -43,8 +54,13 @@ async def download_file(url, save_path, desc):
         async with session.head(url, headers=headers) as response:
             file_size = int(response.headers.get('content-length', 0))
     
-    # 创建一个tqdm进度条实例
-    progress_bar = tqdm(total=file_size, unit='B', unit_scale=True, desc=f'Downloading {desc}')
+    # 创建一个tqdm进度条实例，使用统一的格式
+    progress_bar = tqdm(
+        total=file_size, 
+        unit='B', 
+        unit_scale=True, 
+        desc=f'[{task_index}/{total_tasks}] {desc} {task_type}'
+    )
     
     # 创建目录（如果不存在）
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
@@ -203,6 +219,136 @@ async def login_with_qrcode():
     
     return credential
 
+# 清理文件名，移除非法字符
+def sanitize_filename(filename):
+    # 替换Windows不允许的文件名字符
+    illegal_chars = r'[<>:"/\\|?*]'
+    sanitized = re.sub(illegal_chars, '_', filename)
+    # 去除前后空格
+    sanitized = sanitized.strip()
+    # 确保文件名不为空，如果为空则用默认名称
+    if not sanitized:
+        sanitized = "未命名视频"
+    return sanitized
+
+# 在FFmpeg中合成视频，在单独的线程中运行
+def ffmpeg_merge(video_file, audio_file, output_file, title, index, total_count, duration):
+    try:
+        # 创建统一格式的编码进度条
+        encode_progress_bar = tqdm(
+            total=duration, 
+            unit='second', 
+            desc=f'[{index}/{total_count}] {title} video [3/3]'
+        )
+        
+        cmd_line = f'ffmpeg -i "{video_file}" -i "{audio_file}" -c:v copy -map 0:v:0 -map 1:a:0 -shortest -y "{output_file}"'
+        process = subprocess.Popen(cmd_line, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, 
+                                  universal_newlines=True, encoding='utf-8')
+        
+        # 进度条展示编码进度
+        for line in process.stdout:
+            if line.startswith('size='):
+                time_length = parse_time_2_sec(line)
+                encode_progress_bar.update(time_length - encode_progress_bar.n)
+        
+        # 等待进程完成并检查返回码
+        return_code = process.wait()
+        encode_progress_bar.close()
+        
+        # 检查ffmpeg是否成功完成
+        if return_code != 0:
+            raise Exception(f"FFmpeg失败，返回码: {return_code}")
+            
+        # 检查输出文件是否存在且大小大于0
+        if not os.path.exists(output_file):
+            raise Exception(f"输出文件不存在: {output_file}")
+        if os.path.getsize(output_file) == 0:
+            raise Exception(f"输出文件大小为0: {output_file}")
+            
+        print(f"视频 [{index}/{total_count}] '{title}' 合成成功: {output_file}")
+        
+        # 删除临时文件
+        try:
+            if os.path.exists(audio_file):
+                os.remove(audio_file)
+            if os.path.exists(video_file):
+                os.remove(video_file)
+        except Exception as e:
+            print(f"清理临时文件时出错，但不影响结果: {e}")
+        
+        return True
+    except Exception as e:
+        print(f"合成视频 {index} 时出错: {e}")
+        return False
+
+# 处理单个视频的下载和合成
+async def process_episode(ep, index, total_count, semaphore, course_folder, ffmpeg_executor):
+    async with semaphore:  # 使用信号量控制并发数
+        try:
+            # 基础参数配置
+            ep_id = ep.get_epid()
+            original_title = (await ep.get_meta())['title']
+            # 替换非法字符
+            safe_title = sanitize_filename(original_title)
+            title = format_title(safe_title)  # 格式化标题用于显示
+            
+            # 获取音频和视频的链接，并设置本地保存的文件名
+            filename_prefix = uuid.uuid4()
+            download_url_data = await ep.get_download_url()
+            
+            # 解析下载链接
+            detector = video.VideoDownloadURLDataDetecter(data=download_url_data)
+            streams = detector.detect_best_streams()
+            
+            audio_file = f"./download/temp/{filename_prefix}_audio.m4s"
+            video_file = f"./download/temp/{filename_prefix}_video.m4s"
+            # 使用课程文件夹保存文件
+            output_file = f"./download/{course_folder}/{index}.{safe_title}.mp4"
+            
+            # 确保课程文件夹存在
+            os.makedirs(f"./download/{course_folder}", exist_ok=True)
+            
+            # 下载音频和视频
+            await download_file(streams[1].url, audio_file, title, index, total_count, "audio [1/3]")
+            await download_file(streams[0].url, video_file, title, index, total_count, "video [2/3]")
+            
+            # 验证下载的文件是否存在且大小大于0
+            if not os.path.exists(audio_file) or os.path.getsize(audio_file) == 0:
+                raise Exception(f"音频文件下载失败或大小为0: {audio_file}")
+            if not os.path.exists(video_file) or os.path.getsize(video_file) == 0:
+                raise Exception(f"视频文件下载失败或大小为0: {video_file}")
+            
+            # 获取视频时长用于进度条
+            video_meta = await ep.get_meta()
+            duration = video_meta.get('duration', 0)
+            
+            # 将ffmpeg合成提交到线程池，然后继续下一个下载任务
+            ffmpeg_executor.submit(
+                ffmpeg_merge, 
+                video_file, 
+                audio_file, 
+                output_file, 
+                title, 
+                index, 
+                total_count, 
+                duration
+            )
+            
+            # 不等待ffmpeg完成，直接返回成功，以便继续下载下一个视频
+            return True
+            
+        except Exception as e:
+            print(f"处理视频 {index} 时出错: {e}")
+            # 尝试清理可能的临时文件
+            try:
+                if 'audio_file' in locals() and os.path.exists(audio_file):
+                    os.remove(audio_file)
+                if 'video_file' in locals() and os.path.exists(video_file):
+                    os.remove(video_file)
+            except Exception:
+                pass
+            return False
+
 # 主程序
 async def main():
     credential = None
@@ -237,64 +383,100 @@ async def main():
     input_id = input('请输入要下载的课程序号: ')
     
     # 课程ID处理
-    if input_id.startswith('ss'):
-        season_id = int(input_id[2:])
-        cheese_list = cheese.CheeseList(season_id=season_id, credential=credential)
-    else:
-        try:
-            season_id = int(input_id)
+    try:
+        if input_id.startswith('ss'):
+            season_id = int(input_id[2:])
             cheese_list = cheese.CheeseList(season_id=season_id, credential=credential)
-        except ValueError:
-            print("无效的课程ID，请确保输入正确的格式")
-            return
-    
-    # 获取课程列表
-    episodes = await cheese_list.get_list()
-    
-    index = 0
-    for ep in tqdm(episodes):
-        # 基础参数配置
-        index += 1
-        ep_id = ep.get_epid()
-        title = (await ep.get_meta())['title'].replace(':', '_')
+        else:
+            try:
+                season_id = int(input_id)
+                cheese_list = cheese.CheeseList(season_id=season_id, credential=credential)
+            except ValueError:
+                print("无效的课程ID，请确保输入正确的格式")
+                return
         
-        # 获取音频和视频的链接，并设置本地保存的文件名
-        filename_prefix = uuid.uuid4()
-        download_url_data = await ep.get_download_url()
-        
-        # 解析下载链接
-        detector = video.VideoDownloadURLDataDetecter(data=download_url_data)
-        streams = detector.detect_best_streams()
-        
-        audio_file = f"./download/temp/{filename_prefix}_audio.m4s"
-        video_file = f"./download/temp/{filename_prefix}_video.m4s"
-        output_file = f"./download/{index}.{title}.mp4"
-        
-        # 下载音频和视频
-        await download_file(streams[1].url, audio_file, f'{title} audio [1/3][{index}/{len(episodes)}]')
-        await download_file(streams[0].url, video_file, f'{title} video [2/3][{index}/{len(episodes)}]')
-        
-        # 使用ffmpeg合并音频和视频
-        cmd_line = f'ffmpeg -i "{video_file}" -i "{audio_file}" -c:v copy -map 0:v:0 -map 1:a:0 -shortest -y "{output_file}"'
-        
-        # 获取视频时长用于进度条
-        video_meta = await ep.get_meta()
-        duration = video_meta.get('duration', 0)
-        
-        encode_progress_bar = tqdm(total=duration, unit='second', desc=f'Encoding    {title} video [3/3][{index}/{len(episodes)}]')
-        process = subprocess.Popen(cmd_line, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True, encoding='utf-8')
-        
-        # 进度条展示编码进度
-        for line in process.stdout:
-            if line.startswith('size='):
-                time_length = parse_time_2_sec(line)
-                encode_progress_bar.update(time_length - encode_progress_bar.n)
-        
-        encode_progress_bar.close()
-        
-        # 删除临时文件
-        os.remove(audio_file)
-        os.remove(video_file)
+        # 获取课程信息 - 修正方法为get_meta()
+        try:
+            course_info = await cheese_list.get_meta()
+            if 'title' not in course_info:
+                print(f"获取课程信息失败，API返回: {course_info}")
+                return
+                
+            course_title = sanitize_filename(course_info['title'])
+            print(f"正在下载课程: {course_title}")
+            
+            # 确保课程文件夹存在
+            course_folder = course_title
+            if not os.path.exists(f"./download/{course_folder}"):
+                os.makedirs(f"./download/{course_folder}")
+            
+            # 获取课程列表
+            episodes = await cheese_list.get_list()
+            
+            # 询问用户并行下载数量
+            concurrent_downloads = 1  # 默认值
+            try:
+                user_input = input('请输入并行下载的数量（默认为1）: ').strip()
+                if (user_input):
+                    concurrent_downloads = int(user_input)
+                    if concurrent_downloads < 1:
+                        concurrent_downloads = 1
+                    elif concurrent_downloads > len(episodes):
+                        concurrent_downloads = len(episodes)
+            except ValueError:
+                print("输入无效，使用默认值1")
+                concurrent_downloads = 1
+            
+            # 询问用户并行合成数量
+            concurrent_ffmpeg = 1  # 默认值
+            try:
+                user_input = input('请输入并行合成的数量（默认为1）: ').strip()
+                if user_input:
+                    concurrent_ffmpeg = int(user_input)
+                    if concurrent_ffmpeg < 1:
+                        concurrent_ffmpeg = 1
+                    elif concurrent_ffmpeg > len(episodes):
+                        concurrent_ffmpeg = len(episodes)
+            except ValueError:
+                print("输入无效，使用默认值1")
+                concurrent_ffmpeg = 1
+            
+            print(f"将使用 {concurrent_downloads} 个并行任务下载, {concurrent_ffmpeg} 个并行任务合成")
+            
+            # 创建信号量以限制并发下载数
+            semaphore = Semaphore(concurrent_downloads)
+            
+            # 创建用于ffmpeg合成的线程池
+            with ThreadPoolExecutor(max_workers=concurrent_ffmpeg) as ffmpeg_executor:
+                # 创建所有下载任务
+                tasks = []
+                for i, ep in enumerate(episodes, 1):
+                    task = asyncio.create_task(process_episode(
+                        ep, i, len(episodes), semaphore, course_folder, ffmpeg_executor
+                    ))
+                    tasks.append(task)
+                
+                # 等待所有下载任务完成
+                results = await asyncio.gather(*tasks)
+                
+                # 等待所有ffmpeg合成任务完成
+                print("所有下载任务已完成，等待剩余的合成任务完成...")
+                ffmpeg_executor.shutdown(wait=True)
+            
+            # 统计下载结果
+            success_count = results.count(True)
+            failed_count = len(results) - success_count
+            print(f"下载完成，成功: {success_count}, 失败: {failed_count}")
+            
+        except Exception as e:
+            print(f"处理课程信息时出错: {e}")
+            import traceback
+            traceback.print_exc()
+            
+    except Exception as e:
+        print(f"处理课程ID时出错: {e}")
+        import traceback
+        traceback.print_exc()
 
 if __name__ == "__main__":
     # 运行主程序
