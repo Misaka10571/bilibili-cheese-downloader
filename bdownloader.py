@@ -1,52 +1,73 @@
-import os
-import subprocess
-import time
-import json
-import re
-import uuid
+from os import path, makedirs, remove
+from subprocess import run, Popen, PIPE, STDOUT
+from time import sleep
+from json import loads, dumps
+from re import compile
+from uuid import uuid4
 from tqdm import tqdm
-import threading
-import asyncio
-from asyncio import Semaphore
+from threading import RLock, Lock
+from asyncio import create_task, gather, Semaphore, run as asyncio_run, CancelledError, sleep as asyncio_sleep
 from concurrent.futures import ThreadPoolExecutor
-import concurrent.futures
-import logging
-import configparser
+from logging import basicConfig, FileHandler, StreamHandler, getLogger, INFO, ERROR, WARNING
+from configparser import ConfigParser
 from pathlib import Path
 
 # 导入bilibili-api库
 from bilibili_api import Credential, cheese, video, sync
+from bilibili_api import login_v2
 
 # 设置日志系统
-logging.basicConfig(
-    level=logging.INFO,
+basicConfig(
+    level=INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler("bdownloader.log", encoding='utf-8'),
-        logging.StreamHandler()
+        FileHandler("bdownloader.log", encoding='utf-8'),
+        StreamHandler()
     ]
 )
-logger = logging.getLogger("BDownloader")
+logger = getLogger("BDownloader")
 
 # 全局变量，存储NVIDIA GPU支持状态
 NVIDIA_GPU_SUPPORTED = None
 FORCE_GPU_MODE = None  # 强制使用GPU模式
 
+# 检测FFmpeg是否正确安装
+def check_ffmpeg():
+    try:
+        result = run(['ffmpeg', '-version'], stdout=PIPE, stderr=PIPE, text=True)
+        if result.returncode == 0:
+            logger.info("FFmpeg 已正确安装")
+            return True
+        else:
+            logger.error("FFmpeg 安装异常，无法正常运行")
+            return False
+    except FileNotFoundError:
+        logger.error("未找到 FFmpeg")
+        print("\n错误: FFmpeg 未安装或未添加到系统 PATH 中或放置在当前文件夹下。")
+        print("请安装 FFmpeg 后再运行此程序。")
+        print("安装指南: https://ffmpeg.org/download.html")
+        return False
+    except Exception as e:
+        logger.error(f"检测 FFmpeg 时出错: {e}")
+        print(f"\n错误: 检测 FFmpeg 时出现问题: {e}")
+        print("请确保 FFmpeg 已正确安装")
+        return False
+
 # 创建下载目录
-if not os.path.exists('./download/temp'):
-    os.makedirs('./download/temp')
+if not path.exists('./download/temp'):
+    makedirs('./download/temp')
 
 # 全局变量，用于管理进度条
 PROGRESS_BARS = {}
-PROGRESS_BAR_LOCK = threading.RLock()  # 使用可重入锁
+PROGRESS_BAR_LOCK = RLock()  # 使用可重入锁
 
 # 预编译正则表达式，提高性能
-TIME_PATTERN = re.compile(r'(\d{2}):(\d{2}):(\d{2})')
-ILLEGAL_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*]')
+TIME_PATTERN = compile(r'(\d{2}):(\d{2}):(\d{2})')
+ILLEGAL_FILENAME_CHARS = compile(r'[<>:"/\\|?*]')
 
 # 加载配置文件
 def load_config():
-    config = configparser.ConfigParser()
+    config = ConfigParser()
     config_file = Path('./config.ini')
     
     # 默认配置
@@ -100,7 +121,7 @@ def check_nvidia_gpu_support(force_mode=None):
         # 检查GPU是否可用 - 方法1：检查nvenc编码器
         encoders_output = ""
         try:
-            encoders_result = subprocess.run(['ffmpeg', '-encoders'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            encoders_result = run(['ffmpeg', '-encoders'], stdout=PIPE, stderr=PIPE, text=True)
             encoders_output = encoders_result.stdout.lower()
             nvenc_available = 'h264_nvenc' in encoders_output
             logger.info(f"- NVENC编码器检测: {'✅ 可用' if nvenc_available else '❌ 不可用'}")
@@ -111,7 +132,7 @@ def check_nvidia_gpu_support(force_mode=None):
         # 检查GPU是否可用 - 方法2：检查CUDA硬件加速
         hwaccels_output = ""
         try:
-            hwaccels_result = subprocess.run(['ffmpeg', '-hwaccels'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            hwaccels_result = run(['ffmpeg', '-hwaccels'], stdout=PIPE, stderr=PIPE, text=True)
             hwaccels_output = hwaccels_result.stdout.lower()
             cuda_available = 'cuda' in hwaccels_output
             logger.info(f"- CUDA硬件加速检测: {'✅ 可用' if cuda_available else '❌ 不可用'}")
@@ -122,7 +143,7 @@ def check_nvidia_gpu_support(force_mode=None):
         # 检查GPU是否可用 - 方法3：使用nvidia-smi检查GPU
         nvidia_smi_available = False
         try:
-            nvidia_smi_result = subprocess.run(['nvidia-smi'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            nvidia_smi_result = run(['nvidia-smi'], stdout=PIPE, stderr=PIPE, text=True)
             nvidia_smi_available = nvidia_smi_result.returncode == 0
             logger.info(f"- NVIDIA GPU检测: {'✅ 可用' if nvidia_smi_available else '❌ 不可用'}")
         except Exception:
@@ -169,7 +190,7 @@ def format_title(title, max_length=20):
 class ProgressManager:
     def __init__(self):
         self.bars = {}
-        self.lock = threading.RLock()
+        self.lock = RLock()
     
     def create_bar(self, key, total, desc, position=0, unit='B', leave=False):
         with self.lock:
@@ -220,48 +241,47 @@ async def download_file(url, save_path, desc, task_index, total_tasks, task_type
         "Referer": "https://www.bilibili.com/",
     }
     
-    import aiohttp
+    from aiohttp import ClientSession
     progress_bar_key = f"download_{task_index}_{task_type}"
     
     try:
         # 检查是否已存在部分下载的文件
         downloaded = 0
-        if os.path.exists(save_path):
-            downloaded = os.path.getsize(save_path)
+        if path.exists(save_path):
+            downloaded = path.getsize(save_path)
             logger.info(f"发现已下载文件: {save_path}，大小: {downloaded} 字节")
         
         # 获取文件大小
-        async with aiohttp.ClientSession() as session:
+        async with ClientSession() as session:
             async with session.head(url, headers=headers) as response:
                 file_size = int(response.headers.get('content-length', 0))
         
-        # 如果文件已下载完成，则跳过
-        if downloaded == file_size and file_size > 0:
-            logger.info(f"文件已完整下载，跳过: {save_path}")
-            return True
+            # 如果文件已下载完成，则跳过
+            if downloaded == file_size and file_size > 0:
+                logger.info(f"文件已完整下载，跳过: {save_path}")
+                return True
         
-        # 创建目录（如果不存在）
-        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+            # 创建目录（如果不存在）
+            makedirs(path.dirname(save_path), exist_ok=True)
         
-        # 创建进度条
-        position = task_index % 10
-        progress_bar = progress_mgr.create_bar(
-            progress_bar_key,
-            file_size, 
-            f'[{task_index}/{total_tasks}] {desc} {task_type}',
-            position
-        )
+            # 创建进度条
+            position = task_index % 10
+            progress_bar = progress_mgr.create_bar(
+                progress_bar_key,
+                file_size, 
+                f'[{task_index}/{total_tasks}] {desc} {task_type}',
+                position
+            )
         
-        # 如果文件已部分下载，则设置进度条初始值
-        if downloaded > 0:
-            progress_bar.update(downloaded)
-            headers['Range'] = f'bytes={downloaded}-'
-            logger.info(f"从断点 {downloaded}/{file_size} 字节继续下载...")
+            # 如果文件已部分下载，则设置进度条初始值
+            if downloaded > 0:
+                progress_bar.update(downloaded)
+                headers['Range'] = f'bytes={downloaded}-'
+                logger.info(f"从断点 {downloaded}/{file_size} 字节继续下载...")
         
-        # 下载文件
-        mode = 'ab' if downloaded > 0 else 'wb'  # 如果已部分下载，则使用追加模式
-        try:
-            async with aiohttp.ClientSession() as session:
+            # 下载文件
+            mode = 'ab' if downloaded > 0 else 'wb'  # 如果已部分下载，则使用追加模式
+            try:
                 async with session.get(url, headers=headers) as response:
                     with open(save_path, mode) as f:
                         chunk_size = 32768
@@ -270,19 +290,19 @@ async def download_file(url, save_path, desc, task_index, total_tasks, task_type
                                 break
                             f.write(chunk)
                             progress_mgr.update_bar(progress_bar_key, len(chunk))
-        except asyncio.CancelledError:
-            logger.warning(f"下载任务被取消: {save_path}")
-            raise
-        except Exception as e:
-            logger.error(f"下载过程中出错: {e}，将尝试恢复")
-            # 恢复下载的逻辑已经在外层函数中处理
-            raise
+            except CancelledError:
+                logger.warning(f"下载任务被取消: {save_path}")
+                raise
+            except Exception as e:
+                logger.error(f"下载过程中出错: {e}，将尝试恢复")
+                # 恢复下载的逻辑已经在外层函数中处理
+                raise
         
         # 完成并清理资源
         progress_mgr.close_bar(progress_bar_key)
         
         # 检查文件完整性
-        actual_size = os.path.getsize(save_path)
+        actual_size = path.getsize(save_path)
         if actual_size != file_size and file_size > 0:
             logger.warning(f"文件大小不匹配，预期: {file_size}，实际: {actual_size}")
             if actual_size < file_size * 0.98:
@@ -298,7 +318,6 @@ async def download_file(url, save_path, desc, task_index, total_tasks, task_type
 
 # 使用bilibili-api扫码登录
 async def login_with_qrcode():
-    from bilibili_api import login_v2
     # 创建二维码登录实例
     qr = login_v2.QrCodeLogin(platform=login_v2.QrCodeLoginChannel.WEB)
     await qr.generate_qrcode()
@@ -309,7 +328,7 @@ async def login_with_qrcode():
     while not qr.has_done():
         state = await qr.check_state()
         print(f"登录状态: {state}")
-        await asyncio.sleep(1)
+        await asyncio_sleep(1)
 
     print("登录成功")
     return qr.get_credential()
@@ -394,8 +413,8 @@ def ffmpeg_merge(video_file, audio_file, output_file, title, index, total_count,
         width, height = 1920, 1080
         try:
             video_info_cmd = f'ffprobe -v error -select_streams v:0 -show_entries stream=width,height,codec_name -of json "{video_file}"'
-            video_info = subprocess.run(video_info_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            video_info_json = json.loads(video_info.stdout)
+            video_info = run(video_info_cmd, shell=True, stdout=PIPE, stderr=PIPE, text=True)
+            video_info_json = loads(video_info.stdout)
             width = video_info_json['streams'][0]['width']
             height = video_info_json['streams'][0]['height']
             logger.info(f"检测到视频分辨率: {width}x{height}")
@@ -425,10 +444,10 @@ def ffmpeg_merge(video_file, audio_file, output_file, title, index, total_count,
                     encode_progress_bar.reset()
                 
                 # 执行命令
-                process = subprocess.Popen(
+                process = Popen(
                     cmd_line, 
-                    stdout=subprocess.PIPE, 
-                    stderr=subprocess.STDOUT, 
+                    stdout=PIPE, 
+                    stderr=STDOUT, 
                     universal_newlines=True, 
                     encoding='utf-8'
                 )
@@ -459,19 +478,19 @@ def ffmpeg_merge(video_file, audio_file, output_file, title, index, total_count,
             raise Exception("所有编码方式都失败了，无法合成视频")
         
         # 检查输出文件
-        if not os.path.exists(output_file):
+        if not path.exists(output_file):
             raise Exception(f"输出文件不存在: {output_file}")
-        if os.path.getsize(output_file) == 0:
+        if path.getsize(output_file) == 0:
             raise Exception(f"输出文件大小为0: {output_file}")
             
         logger.info(f"视频 [{index}/{total_count}] '{title}' 合成成功: {output_file}")
         
         # 删除临时文件
         try:
-            if os.path.exists(audio_file):
-                os.remove(audio_file)
-            if os.path.exists(video_file):
-                os.remove(video_file)
+            if path.exists(audio_file):
+                remove(audio_file)
+            if path.exists(video_file):
+                remove(video_file)
         except Exception as e:
             logger.warning(f"清理临时文件时出错，但不影响结果: {e}")
         
@@ -493,7 +512,7 @@ async def process_episode(ep, index, total_count, semaphore, course_folder, ffmp
             title = format_title(safe_title)  # 格式化标题用于显示
             
             # 获取音频和视频的链接，并设置本地保存的文件名
-            filename_prefix = uuid.uuid4()
+            filename_prefix = uuid4()
             download_url_data = await ep.get_download_url()
             
             # 解析下载链接
@@ -506,16 +525,16 @@ async def process_episode(ep, index, total_count, semaphore, course_folder, ffmp
             output_file = f"./download/{course_folder}/{index}.{safe_title}.mp4"
             
             # 确保课程文件夹存在
-            os.makedirs(f"./download/{course_folder}", exist_ok=True)
+            makedirs(f"./download/{course_folder}", exist_ok=True)
             
             # 下载音频和视频
             await download_file(streams[1].url, audio_file, title, index, total_count, "audio [1/3]")
             await download_file(streams[0].url, video_file, title, index, total_count, "video [2/3]")
             
             # 验证下载的文件是否存在且大小大于0
-            if not os.path.exists(audio_file) or os.path.getsize(audio_file) == 0:
+            if not path.exists(audio_file) or path.getsize(audio_file) == 0:
                 raise Exception(f"音频文件下载失败或大小为0: {audio_file}")
-            if not os.path.exists(video_file) or os.path.getsize(video_file) == 0:
+            if not path.exists(video_file) or path.getsize(video_file) == 0:
                 raise Exception(f"视频文件下载失败或大小为0: {video_file}")
             
             # 获取视频时长用于进度条
@@ -541,10 +560,10 @@ async def process_episode(ep, index, total_count, semaphore, course_folder, ffmp
             logger.error(f"处理视频 {index} 时出错: {e}")
             # 尝试清理可能的临时文件
             try:
-                if 'audio_file' in locals() and os.path.exists(audio_file):
-                    os.remove(audio_file)
-                if 'video_file' in locals() and os.path.exists(video_file):
-                    os.remove(video_file)
+                if 'audio_file' in locals() and path.exists(audio_file):
+                    remove(audio_file)
+                if 'video_file' in locals() and path.exists(video_file):
+                    remove(video_file)
             except Exception:
                 pass
             # 返回失败信息，包含视频信息以便重试
@@ -564,6 +583,11 @@ def cleanup_progress_bars():
 # 主程序 - 添加配置文件支持和改进错误处理
 async def main():
     try:
+        # 检查FFmpeg是否已安装
+        if not check_ffmpeg():
+            print("\n程序无法继续，请安装FFmpeg后重试。")
+            return
+            
         # 加载配置
         config = load_config()
         default_concurrent_downloads = config.getint('General', 'concurrent_downloads', fallback=2)
@@ -592,10 +616,10 @@ async def main():
         
         credential = None
         
-        if os.path.exists('./bilibili.session'):
+        if path.exists('./bilibili.session'):
             try:
                 with open('bilibili.session', 'r', encoding='utf-8') as file:
-                    cookies_data = json.loads(file.read())
+                    cookies_data = loads(file.read())
                     credential = Credential(
                         sessdata=cookies_data.get('SESSDATA', ''),
                         bili_jct=cookies_data.get('bili_jct', ''),
@@ -614,7 +638,7 @@ async def main():
         
         # 保存凭证到文件
         with open('bilibili.session', 'w', encoding='utf-8') as file:
-            file.write(json.dumps(credential.get_cookies(), indent=4, ensure_ascii=False))
+            file.write(dumps(credential.get_cookies(), indent=4, ensure_ascii=False))
         
         print('请输入要下载的课程序号,只需要最后的ID')
         print('例如你的课程地址是https://www.bilibili.com/cheese/play/ss360')
@@ -646,8 +670,8 @@ async def main():
                 
                 # 确保课程文件夹存在
                 course_folder = course_title
-                if not os.path.exists(f"./download/{course_folder}"):
-                    os.makedirs(f"./download/{course_folder}")
+                if not path.exists(f"./download/{course_folder}"):
+                    makedirs(f"./download/{course_folder}")
                 
                 # 获取课程列表
                 episodes = await cheese_list.get_list()
@@ -690,13 +714,13 @@ async def main():
                     # 创建所有下载任务
                     tasks = []
                     for i, ep in enumerate(episodes, 1):
-                        task = asyncio.create_task(process_episode(
+                        task = create_task(process_episode(
                             ep, i, len(episodes), semaphore, course_folder, ffmpeg_executor
                         ))
                         tasks.append(task)
                     
                     # 等待所有下载任务完成
-                    results = await asyncio.gather(*tasks)
+                    results = await gather(*tasks)
                     
                     # 筛选出失败的任务
                     failed_tasks = [r for r in results if not r["success"]]
@@ -710,7 +734,7 @@ async def main():
                         retry_tasks = []
                         for failed in failed_tasks:
                             print(f"重新下载视频 [{failed['index']}/{len(episodes)}]...")
-                            task = asyncio.create_task(process_episode(
+                            task = create_task(process_episode(
                                 failed["episode"], 
                                 failed["index"], 
                                 len(episodes), 
@@ -722,7 +746,7 @@ async def main():
                         
                         # 等待重试任务完成
                         if retry_tasks:
-                            retry_results = await asyncio.gather(*retry_tasks)
+                            retry_results = await gather(*retry_tasks)
                             
                             # 更新成功计数
                             retry_success = sum(1 for r in retry_results if r["success"])
@@ -740,28 +764,28 @@ async def main():
                 
             except Exception as e:
                 logger.error(f"处理课程信息时出错: {e}")
-                import traceback
-                traceback.print_exc()
+                from traceback import print_exc
+                print_exc()
                 
         except Exception as e:
             logger.error(f"处理课程ID时出错: {e}")
-            import traceback
-            traceback.print_exc()
+            from traceback import print_exc
+            print_exc()
         
         # 在主函数结束前确保清理所有进度条
         progress_mgr.close_all()
         
     except Exception as e:
         logger.error(f"程序执行出错: {e}")
-        import traceback
-        traceback.print_exc()
+        from traceback import print_exc
+        print_exc()
         # 确保清理资源
         progress_mgr.close_all()
 
 if __name__ == "__main__":
     # 运行主程序
     try:
-        asyncio.run(main())
+        asyncio_run(main())
     except KeyboardInterrupt:
         logger.warning("\n程序被用户中断")
         progress_mgr.close_all()
